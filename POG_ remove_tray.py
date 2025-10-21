@@ -205,52 +205,104 @@ class FillLayer(RemoveTray):
             # 存储结果
             self.sorted_items_by_position[(module_id, layer_id)] = sorted_df
             print(f"已完成对 Module {module_id}, Layer {layer_id} 中商品的位置排序。")
+            
     def fill_and_reposition_layers(self, pog_data_key: str = 'pog_result', total_layer_width: int = 1000):
-
+        """
+        使用本层销量最高的商品填充剩余空间（每个商品总数最多2个），
+        确保复制品与原商品邻近，然后重新计算所有商品的位置。
+        """
         print("\n" + "="*50)
-        print("      开始执行核心填充与重新定位功能")
+        print("      开始执行核心填充与重新定位功能 (最多2个/项)")
         print("="*50)
+
         updated_layers_data = []
+
+        # 1. 遍历每个受影响的层
         for layer_tuple in self.affected_layers_by_removal:
             module_id, layer_id = layer_tuple
             print(f"\n--- 正在处理 Layer: {layer_tuple} ---")
-            if layer_tuple not in self.sorted_items_by_position or self.sorted_items_by_position[layer_tuple].empty:
+
+            # 2. 条件检查
+            if (layer_tuple not in self.sorted_items_by_position or 
+                self.sorted_items_by_position[layer_tuple].empty):
                 print(f"Layer {layer_tuple} 中无剩余商品，跳过填充操作。")
                 continue
-            if layer_tuple not in self.sorted_items_by_layer or self.sorted_items_by_layer[layer_tuple].empty:
+            if (layer_tuple not in self.sorted_items_by_layer or 
+                self.sorted_items_by_layer[layer_tuple].empty):
                 print(f"Layer {layer_tuple} 中没有可用于填充的候选商品，跳过。")
                 continue
+
+            # 3. 获取数据源
             fill_candidates = self.sorted_items_by_layer[layer_tuple]
-            original_items_df = self.sorted_items_by_position[layer_tuple].copy()
-            initial_remaining_width = self.affected_layer_space.query(f"module_id == {module_id} and layer_id == {layer_id}")['remaining_width'].iloc[0]
-            newly_placed_items = []
+            original_items_by_pos = self.sorted_items_by_position[layer_tuple].copy()
+            
+            space_query = self.affected_layer_space.query(f"module_id == {module_id} and layer_id == {layer_id}")
+            initial_remaining_width = space_query['remaining_width'].iloc[0]
             current_remaining_width = initial_remaining_width
+
+            # 4. 步骤 1: 虚拟填充，计算每个商品需要复制多少
+            copies_to_add = {}
+            
+            # --- 新逻辑: 统计原始数量 ---
+            # .to_dict() 确保我们得到一个可修改的字典
+            current_item_counts = original_items_by_pos['item_code'].value_counts().to_dict()
+            print(f"  原始商品数量: {current_item_counts}")
+            
+            print("  开始虚拟填充 (最多2个/项)...")
             for _, candidate in fill_candidates.iterrows():
-                if current_remaining_width >= candidate['item_width']:
-                    new_item = candidate.to_dict()
-                    new_item['position'] = -1
-                    newly_placed_items.append(new_item)
-                    current_remaining_width -= candidate['item_width']
-                    print(f"  + 填充商品 {new_item['item_code']} (宽度: {new_item['item_width']})。剩余空间: {current_remaining_width:.2f}")
-            if not newly_placed_items:
-                print("剩余空间不足以填充任何新商品。")
-                all_items_on_layer = original_items_df
+                item_code = candidate['item_code']
+                item_width = candidate['item_width']
+                
+                # 获取当前该商品的总数（原始+已添加的复制品）
+                current_count = current_item_counts.get(item_code, 0)
+                
+                # --- MODIFIED: 循环条件中增加 'current_count < 2' ---
+                while current_count < 2 and current_remaining_width >= item_width:
+                    # 规则检查通过，可以添加一个
+                    copies_to_add[item_code] = copies_to_add.get(item_code, 0) + 1
+                    current_remaining_width -= item_width
+                    
+                    # 关键：更新运行总数
+                    current_count += 1
+                    current_item_counts[item_code] = current_count
+                    
+                    print(f"    + 虚拟添加 {item_code} (宽度: {item_width})。总数: {current_count}。剩余空间: {current_remaining_width:.2f}")
+
+            # 5. 步骤 2: 构建邻近布局 (此部分逻辑无需修改)
+            final_item_list_for_layer = []
+            if not copies_to_add:
+                print("  剩余空间不足以填充任何新商品。")
+                all_items_on_layer_df = original_items_by_pos
             else:
-                print(f"已为该层新填充 {len(newly_placed_items)} 个商品。")
-                all_items_on_layer = pd.concat([original_items_df, pd.DataFrame(newly_placed_items)], ignore_index=True)
-            total_items_width = all_items_on_layer['item_width'].sum()
+                print("  虚拟填充完成。开始构建邻近布局...")
+                for _, original_item in original_items_by_pos.iterrows():
+                    final_item_list_for_layer.append(original_item.to_dict())
+                    item_code = original_item['item_code']
+                    num_copies = copies_to_add.get(item_code, 0)
+                    if num_copies > 0:
+                        print(f"    > 为 {item_code} 添加 {num_copies} 个邻近复制品。")
+                        copy_item_dict = original_item.to_dict()
+                        copy_item_dict['position'] = -1
+                        for _ in range(num_copies):
+                            final_item_list_for_layer.append(copy_item_dict.copy())
+                        del copies_to_add[item_code]
+                all_items_on_layer_df = pd.DataFrame(final_item_list_for_layer)
+            
+            # 6. 步骤 3: 重新定位 (此部分逻辑无需修改)
+            total_items_width = all_items_on_layer_df['item_width'].sum()
             final_remaining_width = total_layer_width - total_items_width
-            num_items = len(all_items_on_layer)
+            num_items = len(all_items_on_layer_df)
             spacing = (final_remaining_width / (num_items - 1)) if num_items > 1 else 0
-            print(f"该层商品总数: {num_items}, 总宽度: {total_items_width}, 最终间距: {spacing:.2f}")
-            all_items_on_layer = all_items_on_layer.sort_values(by='sales', ascending=False).reset_index(drop=True)
+            print(f"  该层商品总数: {num_items}, 总宽度: {total_items_width:.2f}, 最终间距: {spacing:.2f}")
             new_positions = []
             current_pos = 0.0
-            for _, item in all_items_on_layer.iterrows():
+            for _, item in all_items_on_layer_df.iterrows():
                 new_positions.append(current_pos)
                 current_pos += item['item_width'] + spacing
-            all_items_on_layer['position'] = new_positions
-            updated_layers_data.append(all_items_on_layer)
+            all_items_on_layer_df['position'] = new_positions
+            updated_layers_data.append(all_items_on_layer_df)
+
+        # 7. 最终更新 (此部分逻辑无需修改)
         if not updated_layers_data:
             print("\n没有层被更新，最终结果与移除tray后相同。")
             self.dataframes['pog_result_filled'] = self.dataframes[pog_data_key]
@@ -265,7 +317,6 @@ class FillLayer(RemoveTray):
         print("      核心填充与重新定位功能执行完毕！")
         print("      最终结果已保存在 dataframes['pog_result_filled'] 中")
         print("="*50)
-
 
     def save_final_result(self, output_file_path: str, data_key: str = 'pog_result_filled'):
         """
@@ -292,11 +343,14 @@ class FillLayer(RemoveTray):
             print(f"最终结果已成功保存到: {output_file_path}")
         except Exception as e:
             print(f"[错误] 保存文件时发生错误: {e}")
+
+
 filler = FillLayer()
-
 filler.load_data(file_path="开发所需测试数据\开发所需测试数据\pog_result.csv", key_name='pog_result')
+analyse_result = filler.analyze_layer_space(data_key='pog_result')
+# print("\n--- 分析结果预览 ---")
+# print(analyse_result)
 filler.remove_tray_items(data_key='pog_result')
-
 filler.calculate_space_for_affected_layers()
 
 # 调用方法一：按销量排序
